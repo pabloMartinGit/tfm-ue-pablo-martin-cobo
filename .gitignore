@@ -1,0 +1,21 @@
+# Secretos
+.env
+certs/*.key
+# PKI interna (CA y SVID mTLS), se genera con make pki
+certs/internal/
+
+# Editores / sistema
+*.swp
+*.swo
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Resultados de pruebas
+reports/

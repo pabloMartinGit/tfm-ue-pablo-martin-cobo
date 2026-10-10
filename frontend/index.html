@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zero Trust IAM · Consola</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🛡️</span>
+      <div>
+        <h1>Zero Trust IAM</h1>
+        <p>Consola de demostración · TFM Desarrollo seguro en microservicios</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="health-pill" class="pill pill-muted" title="Estado del gateway">comprobando…</span>
+      <a class="link" href="/auth/admin/" target="_blank" rel="noopener">Consola Keycloak ↗</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ============ COLUMNA IZQUIERDA: IDENTIDAD ============ -->
+    <section class="col col-left">
+      <div class="card">
+        <div class="card-head">
+          <h2>1 · Identidad</h2>
+          <span class="hint">Keycloak (OAuth 2.0 / OIDC)</span>
+        </div>
+
+        <label class="field">
+          <span>Contraseña de los usuarios demo</span>
+          <input id="demo-password" type="password" autocomplete="off"
+                 placeholder="TFM_DEMO_PASSWORD de tu .env">
+          <small>Se guarda solo en esta pestaña (sessionStorage). Los tokens viven en memoria.</small>
+        </label>
+
+        <div id="identities" class="identity-grid"><!-- tarjetas de usuario --></div>
+        <p class="ropc-note">El grant de contraseña (arriba) es el modo de pruebas del PoC y nunca
+          acredita step-up (<code>acr=aal1</code>). El modo recomendado en producción es el BFF (abajo):
+          el navegador no maneja tokens.</p>
+      </div>
+
+      <div class="card" id="bff-card">
+        <div class="card-head">
+          <h2>2 · BFF · Token Handler</h2>
+          <span class="hint">Authorization Code + PKCE · cookie</span>
+        </div>
+        <div id="bff-status" class="bff-status"><!-- login o sesión BFF --></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>3 · Token de acceso</h2>
+          <span id="token-exp" class="hint"></span>
+        </div>
+        <div id="token-inspector" class="token-empty">
+          Entra con un usuario para inspeccionar su JWT.
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ COLUMNA DERECHA: OPERACIONES Y ESCENARIOS ============ -->
+    <section class="col col-right">
+      <div class="card">
+        <div class="card-head">
+          <h2>4 · Operaciones</h2>
+          <label class="actor">
+            <span>actuando como</span>
+            <select id="actor-select" class="select-inline"><option value="">—</option></select>
+          </label>
+        </div>
+
+        <div class="ops">
+          <div class="op">
+            <button class="btn" data-op="inventory">GET catálogo</button>
+            <span class="op-desc">Inventario del tenant · <code>inventory:read</code></span>
+          </div>
+
+          <div class="op op-form">
+            <div class="op-form-row">
+              <button class="btn" data-op="create-order">POST pedido</button>
+              <select id="order-sku" class="select-inline"><option value="">SKU… (pulsa GET catálogo)</option></select>
+              <input id="order-qty" class="input-inline" type="number" min="1" max="100" value="1">
+            </div>
+            <span class="op-desc">Crea pedido → reserva → pago → confirma · <code>orders:create</code></span>
+          </div>
+
+          <div class="op">
+            <button class="btn" data-op="list-orders">GET mis pedidos</button>
+            <span class="op-desc">Listado filtrado por el PDP</span>
+          </div>
+
+          <div class="op op-form">
+            <div class="op-form-row">
+              <button class="btn" data-op="get-order">GET pedido</button>
+              <input id="order-id" class="input-inline input-grow" type="text" placeholder="order_id (se rellena al crear un pedido)">
+            </div>
+            <span class="op-desc">Leer un pedido concreto · prueba BOLA cambiando de actor</span>
+          </div>
+
+          <div class="op op-form">
+            <div class="op-form-row">
+              <button class="btn" data-op="cancel-order">POST cancelar</button>
+              <input id="cancel-id" class="input-inline input-grow" type="text" placeholder="order_id">
+            </div>
+            <span class="op-desc">Cancelar pedido · <code>orders:cancel</code></span>
+          </div>
+
+          <div class="op">
+            <button class="btn btn-danger" data-op="purge">DELETE purga admin</button>
+            <span class="op-desc">Función administrativa · <code>admin:purge</code> (rol admin + clearance 5 + step-up <code>acr=aal2</code>)</span>
+          </div>
+        </div>
+
+        <div class="response">
+          <div class="response-head">
+            <span>Respuesta</span>
+            <div class="response-actions">
+              <button id="response-trace" class="btn btn-ghost btn-sm" hidden>Ver traza ›</button>
+              <span id="response-status" class="pill pill-muted">—</span>
+            </div>
+          </div>
+          <pre id="response-body">Sin peticiones todavía.</pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>5 · Escenarios guiados</h2>
+          <div class="response-actions">
+            <span id="scenario-summary" class="pill pill-muted" hidden></span>
+            <button id="run-all" class="btn btn-sm">Ejecutar todos</button>
+          </div>
+        </div>
+        <p class="scenario-note">
+          Cada escenario inicia sesión con los usuarios que necesita (usa la contraseña de arriba),
+          ejecuta las llamadas y comprueba el resultado esperado. Sus llamadas quedan en el registro:
+          pincha en ellas para ver la traza.
+        </p>
+        <div id="scenarios"><!-- grupos de escenarios --></div>
+
+        <details class="internal-note">
+          <summary>Pruebas de movimiento lateral (ST-18…23, ST-34, ST-35)</summary>
+          <p>
+            No son ejecutables desde el navegador: los servicios de Pagos, Inventario, el colector de
+            trazas y las rutas <code>/internal/*</code> no están publicados en el gateway — precisamente
+            esa es la propiedad de seguridad que se valida. Se ejecutan desde la red interna con
+            <code>make test</code>.
+          </p>
+        </details>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ REGISTRO DE ACTIVIDAD ============ -->
+  <section class="card log-card">
+    <div class="card-head">
+      <h2>Registro de actividad</h2>
+      <div class="response-actions">
+        <span class="hint">Pincha en una llamada para ver cómo ha viajado entre los componentes</span>
+        <button id="clear-log" class="btn btn-ghost btn-sm">Limpiar</button>
+      </div>
+    </div>
+    <div id="log" class="log"><!-- entradas --></div>
+  </section>
+
+  <footer class="footer">
+    <span>PoC Zero Trust · Keycloak (IdP) + Nginx (PEP) + OPA (PDP) + microservicios FastAPI · trazas W3C Trace Context</span>
+  </footer>
+
+  <!-- ============ PANEL DE TRAZA ============ -->
+  <div id="drawer-backdrop" class="drawer-backdrop"></div>
+  <aside id="trace-drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <div class="drawer-title">
+        <h2>Traza distribuida</h2>
+        <button id="drawer-close" class="btn btn-ghost btn-sm" aria-label="Cerrar">✕</button>
+      </div>
+      <div id="drawer-summary" class="drawer-summary"></div>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>

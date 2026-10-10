@@ -1,0 +1,413 @@
+# =============================================================================
+# PoC Zero Trust IAM en microservicios - TFM MUSTIC 25/26
+# Topología de red (memoria 7.1.1, Ilustración 11):
+#   frontend-net : única red con puertos publicados (solo el API Gateway).
+#   backend-net  : red interna de aplicación (sin salida al exterior).
+#   auth-net     : red interna de persistencia del IdP (Keycloak <-> PostgreSQL).
+# Tráfico este-oeste: mTLS (TLS 1.3) + HTTP/2 entre todas las cargas de trabajo de
+# backend-net. Cada contenedor monta SOLO su SVID (certs/internal/<carga>, emitido
+# por scripts/gen-internal-pki.sh con formato SPIFFE) en /run/svid.
+# Los secretos se leen del fichero .env (ver .env.example).
+# =============================================================================
+name: tfm-zero-trust
+
+networks:
+  frontend-net:
+    name: tfm-frontend-net
+    driver: bridge
+  backend-net:
+    name: tfm-backend-net
+    driver: bridge
+    internal: true
+  auth-net:
+    name: tfm-auth-net
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-service-env: &service-env
+  OIDC_ISSUER: ${OIDC_ISSUER}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+  # Back-channel con el IdP por mTLS (JWKS, client_credentials, Token Exchange)
+  OIDC_JWKS_URL: https://keycloak:8443/auth/realms/tfm/protocol/openid-connect/certs
+  OIDC_TOKEN_URL: https://keycloak:8443/auth/realms/tfm/protocol/openid-connect/token
+  # Introspección RFC 7662 (revocación en tiempo real de operaciones críticas)
+  OIDC_INTROSPECTION_URL: https://keycloak:8443/auth/realms/tfm/protocol/openid-connect/token/introspect
+  OIDC_ALLOWED_ALGS: RS256
+  OPA_DECISION_URL: https://opa:8181/v1/data/tfm/authz/decision
+  # Colector de trazas distribuidas (W3C traceparent); vacío = sin exportación.
+  TRACE_COLLECTOR_URL: https://trace-service:8443/internal/v1/spans
+  # Identidad de la carga de trabajo (workload_identity.py)
+  SPIFFE_TRUST_DOMAIN: tfm.local
+  # Solo en el PoC: incluye los motivos de denegación del PDP en las respuestas 403.
+  EXPOSE_DENY_REASONS: "true"
+
+x-service: &service
+  <<: *hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  networks:
+    - backend-net
+  depends_on:
+    keycloak:
+      condition: service_healthy
+    opa:
+      condition: service_started
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 256M
+
+services:
+  # ===========================================================================
+  # PLANO DE CONTROL
+  # ===========================================================================
+
+  # --- Persistencia del IdP ---------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: tfm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - auth-net
+    security_opt:
+      - no-new-privileges:true
+    user: "70:70"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Proveedor de identidades (IdP / PA): Keycloak --------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    container_name: tfm-keycloak
+    restart: unless-stopped
+    command: ["start", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # URL pública fija (issuer de los tokens) detrás del gateway. Keycloak se
+      # sirve también bajo /auth para que el discovery sea coherente por ambas vías;
+      # las llamadas internas (JWKS, token) usan https://keycloak:8443/auth.
+      KC_HOSTNAME: https://localhost:8443/auth
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_PROXY_HEADERS: xforwarded
+      # Solo HTTPS (TLS 1.3) con el SVID de Keycloak y certificado de cliente
+      # obligatorio: únicamente las cargas de trabajo con SVID hablan con el IdP.
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_PORT: "8443"
+      KC_HTTPS_CERTIFICATE_FILE: /run/svid/svid.pem
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /run/svid/svid.key
+      KC_HTTPS_CLIENT_AUTH: required
+      KC_HTTPS_PROTOCOLS: TLSv1.3
+      KC_TRUSTSTORE_PATHS: /run/svid/bundle.pem
+      # Puerto de gestión (9000, health/metrics) en HTTP para el healthcheck local.
+      KC_HTTP_MANAGEMENT_SCHEME: http
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_LOG_CONSOLE_OUTPUT: json
+      # Valores sustituidos en keycloak/realm-tfm.json durante la importación
+      TFM_DEMO_PASSWORD: ${TFM_DEMO_PASSWORD}
+      TFM_MFA_SECRET: ${TFM_MFA_SECRET}
+      ORDERS_CLIENT_SECRET: ${ORDERS_CLIENT_SECRET}
+      PAYMENTS_CLIENT_SECRET: ${PAYMENTS_CLIENT_SECRET}
+      INVENTORY_CLIENT_SECRET: ${INVENTORY_CLIENT_SECRET}
+      BFF_CLIENT_SECRET: ${BFF_CLIENT_SECRET}
+    volumes:
+      - ./keycloak/realm-tfm.json:/opt/keycloak/data/import/realm-tfm.json:ro
+      - ./certs/internal/keycloak:/run/svid:ro
+    networks:
+      - auth-net
+      - backend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    <<: *hardening
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1536M
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /auth/health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # --- Motor de políticas (PDP / PE): Open Policy Agent -----------------------
+  opa:
+    image: openpolicyagent/opa:1.21.0-static
+    container_name: tfm-opa
+    <<: *hardening
+    restart: unless-stopped
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --log-format=json
+      - --log-level=info
+      # mTLS: solo cargas de trabajo con SVID de la CA interna (TLS 1.3); la
+      # identidad del certificado cliente la evalúa opa/system/system.rego.
+      - --tls-cert-file=/run/svid/svid.pem
+      - --tls-private-key-file=/run/svid/svid.key
+      - --tls-ca-cert-file=/run/svid/bundle.pem
+      - --tls-cert-refresh-period=1h
+      - --min-tls-version=1.3
+      - --authentication=tls
+      # Bloquea la API de gestión (subida/borrado de políticas) y limita las
+      # consultas de decisión a los PEP: opa/system/system.rego
+      - --authorization=basic
+      # Decision logs en consola -> traza de auditoría de cada allow/deny (RU-06)
+      - --set=decision_logs.console=true
+      # Recarga en caliente al modificar los .rego (RU-04: sin redesplegar servicios)
+      - --watch
+      - /policies
+      - /system
+    volumes:
+      - ./opa/policies:/policies:ro
+      - ./opa/system:/system:ro
+      - ./certs/internal/opa:/run/svid:ro
+    networks:
+      - backend-net
+    read_only: true
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ===========================================================================
+  # PLANO DE DATOS
+  # ===========================================================================
+
+  # --- API Gateway / PEP perimetral: Nginx + njs ------------------------------
+  api-gateway:
+    image: nginxinc/nginx-unprivileged:1.30-alpine
+    container_name: tfm-api-gateway
+    <<: *hardening
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+      - "8080:8080"
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE}
+      # El njs consulta el JWKS y el BFF (cookie -> token) a través del servidor
+      # interno del gateway (127.0.0.1:8081), que los reenvía por mTLS.
+      OIDC_JWKS_URL: http://127.0.0.1:8081/_internal/jwks
+      BFF_TOKEN_URL: http://127.0.0.1:8081/_internal/bff-token
+      # Solo en el PoC: el 401 del borde incluye el motivo del rechazo (edge_reason).
+      EXPOSE_DENY_REASONS: "true"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway/proxy-common.inc:/etc/nginx/proxy-common.inc:ro
+      - ./gateway/keycloak-proxy.inc:/etc/nginx/keycloak-proxy.inc:ro
+      - ./gateway/upstream-tls.inc:/etc/nginx/upstream-tls.inc:ro
+      - ./gateway/njs:/etc/nginx/njs:ro
+      - ./certs/gateway.crt:/etc/nginx/certs/gateway.crt:ro
+      - ./certs/gateway.key:/etc/nginx/certs/gateway.key:ro
+      - ./certs/internal/api-gateway:/etc/nginx/svid:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    tmpfs:
+      - /tmp
+    read_only: true
+    networks:
+      - frontend-net
+      - backend-net
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      orders-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      trace-service:
+        condition: service_healthy
+      bff:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8443 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Microservicio A: Pedidos ----------------------------------------------
+  orders-service:
+    <<: *service
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args:
+        SERVICE: orders
+    image: tfm/orders-service:0.1.0
+    container_name: tfm-orders-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: orders-service
+      SERVICE_CLIENT_ID: orders-service
+      SERVICE_CLIENT_SECRET: ${ORDERS_CLIENT_SECRET}
+      INVENTORY_SERVICE_URL: https://inventory-service:8443
+      PAYMENTS_SERVICE_URL: https://payments-service:8443
+    volumes:
+      - ./certs/internal/orders-service:/run/svid:ro
+
+  # --- Microservicio B: Pagos (no publicado en el gateway) --------------------
+  payments-service:
+    <<: *service
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args:
+        SERVICE: payments
+    image: tfm/payments-service:0.1.0
+    container_name: tfm-payments-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: payments-service
+      SERVICE_CLIENT_ID: payments-service
+      SERVICE_CLIENT_SECRET: ${PAYMENTS_CLIENT_SECRET}
+    volumes:
+      - ./certs/internal/payments-service:/run/svid:ro
+
+  # --- Microservicio C: Inventario --------------------------------------------
+  inventory-service:
+    <<: *service
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args:
+        SERVICE: inventory
+    image: tfm/inventory-service:0.1.0
+    container_name: tfm-inventory-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: inventory-service
+      SERVICE_CLIENT_ID: inventory-service
+      SERVICE_CLIENT_SECRET: ${INVENTORY_CLIENT_SECRET}
+    volumes:
+      - ./certs/internal/inventory-service:/run/svid:ro
+
+  # --- BFF / Token Handler -----------------------------------------------------
+  # Realiza el flujo Authorization Code + PKCE y guarda los tokens en el servidor;
+  # el navegador solo recibe una cookie de sesión (patrón 7.1.2.1). No está en la
+  # ruta de datos: no consulta OPA ni exporta trazas.
+  bff:
+    <<: *service
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args:
+        SERVICE: bff
+    image: tfm/bff:0.1.0
+    container_name: tfm-bff
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_TOKEN_URL: https://keycloak:8443/auth/realms/tfm/protocol/openid-connect/token
+      OIDC_JWKS_URL: https://keycloak:8443/auth/realms/tfm/protocol/openid-connect/certs
+      BFF_CLIENT_ID: tfm-bff
+      BFF_CLIENT_SECRET: ${BFF_CLIENT_SECRET}
+      BFF_REDIRECT_URI: https://localhost:8443/bff/callback
+      COOKIE_SECURE: "true"
+      SPIFFE_TRUST_DOMAIN: tfm.local
+    volumes:
+      - ./certs/internal/bff:/run/svid:ro
+
+  # --- Colector de trazas (observabilidad, RU-06) ------------------------------
+  # Recibe los spans de los microservicios (solo M2M) y sirve las trazas a la
+  # consola vía gateway. No necesita cliente en Keycloak: no invoca a otros servicios.
+  trace-service:
+    <<: *service
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args:
+        SERVICE: traces
+    image: tfm/trace-service:0.1.0
+    container_name: tfm-trace-service
+    environment:
+      <<: *service-env
+      SERVICE_NAME: trace-service
+      TRACE_COLLECTOR_URL: ""
+    volumes:
+      - ./certs/internal/trace-service:/run/svid:ro
+
+  # ===========================================================================
+  # VALIDACIÓN (O5) - solo con: docker compose --profile tests run --rm security-tests
+  # Simula un cliente externo y, a la vez, un contenedor comprometido dentro de
+  # la red backend (pruebas de movimiento lateral). Tiene su propio SVID (identidad
+  # válida sin permisos) y una copia del de orders-service para simular que ese
+  # servicio ha sido comprometido (clave privada + secreto de cliente robados).
+  # ===========================================================================
+  security-tests:
+    profiles: ["tests"]
+    build:
+      context: ./tests
+    image: tfm/security-tests:0.1.0
+    container_name: tfm-security-tests
+    environment:
+      # Las pruebas usan el origen público (issuer, redirect_uri del BFF): un
+      # reenviador local del contenedor lleva localhost:8443 al gateway.
+      GATEWAY_URL: https://localhost:8443
+      GATEWAY_UPSTREAM: api-gateway:8443
+      GATEWAY_HTTP_URL: http://api-gateway:8080
+      CA_BUNDLE: /certs/gateway.crt
+      TFM_DEMO_PASSWORD: ${TFM_DEMO_PASSWORD}
+      TFM_MFA_SECRET: ${TFM_MFA_SECRET}
+      ORDERS_CLIENT_SECRET: ${ORDERS_CLIENT_SECRET}
+      INVENTORY_CLIENT_SECRET: ${INVENTORY_CLIENT_SECRET}
+      # Administración del IdP desde la red interna (rotación de claves, fuerza bruta):
+      # las pruebas crean y retiran sus propios recursos temporales.
+      KC_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      KEYCLOAK_URL: https://keycloak:8443/auth
+      PAYMENTS_URL: https://payments-service:8443
+      INVENTORY_URL: https://inventory-service:8443
+      TRACES_URL: https://trace-service:8443
+      OPA_URL: https://opa:8181
+      SVID_DIR: /run/svid
+      COMPROMISED_SVID_DIR: /run/svid-orders
+    volumes:
+      - ./certs/gateway.crt:/certs/gateway.crt:ro
+      - ./certs/internal/security-tests:/run/svid:ro
+      - ./certs/internal/orders-service:/run/svid-orders:ro
+    networks:
+      - frontend-net
+      - backend-net
+    depends_on:
+      api-gateway:
+        condition: service_healthy
