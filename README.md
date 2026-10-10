@@ -7,8 +7,7 @@ Marco de trabajo IAM para microservicios bajo el paradigma **Zero Trust**: la id
 el perímetro, cada petición se autentica en el borde y se vuelve a verificar y autorizar en
 cada salto interno, y la lógica de autorización vive fuera del código de negocio (*Policy as Code*).
 
-> Estado: **MVP funcional** (base para la fase de desarrollo, apartado 7.2 de la memoria).
-> Ver [docs/trazabilidad-tfm.md](docs/trazabilidad-tfm.md) para la correspondencia
+> Estado: **MVP funcional**
 > memoria ↔ código, las decisiones tomadas y el backlog de siguientes iteraciones.
 
 ## Arquitectura
@@ -52,7 +51,7 @@ cada salto interno, y la lógica de autorización vive fuera del código de nego
 | BFF | `services/` (`bff`) | Token Handler: Authorization Code + PKCE, cookie de sesión |
 | Trazas | `services/` (`traces`) | Colector de trazas distribuidas (observabilidad, RU-06) |
 
-### Flujo de un pedido (Ilustración 12 de la memoria)
+### Flujo de un pedido
 
 1. El cliente obtiene un access token de Keycloak (RS256, 5 min) con `sub`, `tenant_id`,
    `clearance_level`, `max_transaction_limit`, `acr`/`amr` y roles. Su audiencia es solo la API
@@ -168,7 +167,7 @@ Todos usan la contraseña `TFM_DEMO_PASSWORD` de `.env`.
 | `ivan` | operators, **deshabilitado** | — | beta | 3 | 5.000 | no | cuenta suspendida en el IdP (RU-05) |
 
 `supervisor` es un rol compuesto de Keycloak: el token de hector incluye `supervisor` y el
-`operator` heredado (RBAC jerárquico, apartado 4.3.1.1 de la memoria).
+`operator` heredado (RBAC jerárquico).
 
 Los roles de Inventario y Pagos siguen asignados a los usuarios en Keycloak, pero **no viajan en
 el token del navegador**: los clientes de usuario (`tfm-web`, `tfm-bff`) solo pueden emitir roles
@@ -205,7 +204,7 @@ spans del colector (`traces:ingest`) solo admite cuentas de servicio de los micr
 también vinculadas a su identidad mTLS. Las acciones de usuario solo se aceptan si llegan a través
 del gateway (identidad mTLS `api-gateway`).
 
-## Pruebas de seguridad (objetivo O5)
+## Pruebas de seguridad
 
 - `opa/`: 47 pruebas unitarias (42 de la política de autorización y 5 de la API del PDP).
 - `tests/`: 58 pruebas de extremo a extremo (ST-01 … ST-59) que se ejecutan desde un
@@ -240,7 +239,7 @@ al final y esperan a que se recupere el cupo de la IP de pruebas.
 
 Mecanismos que refuerzan la gestión de identidad más allá del token stateless:
 
-- **BFF / Token Handler** (patrón 7.1.2.1). El servicio `bff` realiza el flujo *Authorization
+- **BFF / Token Handler**. El servicio `bff` realiza el flujo *Authorization
   Code + PKCE* contra Keycloak (cliente confidencial `tfm-bff`) y guarda los tokens **en el
   servidor**. El navegador solo recibe la cookie `__Host-tfm_session` (`HttpOnly · Secure ·
   SameSite=Strict`), lo que neutraliza la exfiltración de tokens por XSS. Para las llamadas a la
@@ -258,7 +257,7 @@ Mecanismos que refuerzan la gestión de identidad más allá del token stateless
 - **Revocación en tiempo real (introspección RFC 7662)**. La operación crítica `payments:execute`
   «pivota a un modelo con estado»: tras autorizar, pregunta a Keycloak si el token sigue activo.
   Un token de una sesión cerrada (logout) o revocada se rechaza (`401 token_revoked`) aunque no
-  haya expirado, resolviendo la principal limitación del modelo stateless (memoria 4.2.2.3). Con
+  haya expirado, resolviendo la principal limitación del modelo stateless. Con
   Token Exchange, cada canje es además un punto de revocación: el STS no canjea tokens de
   sesiones cerradas.
 - **Token Exchange (RFC 8693), audiencia reducida en cada salto** (Tabla 8). El token del
@@ -267,7 +266,7 @@ Mecanismos que refuerzan la gestión de identidad más allá del token stateless
   `azp` = `orders-service` y solo los roles de ese destino. Un token capturado en un salto no
   sirve en otro, y el token de borde reenviado tal cual (*Token Relay*) se rechaza. El coste
   (~15-30 ms por canje en local) se memoriza por petición y aparece en la traza.
-- **mTLS interno con identidades SPIFFE y HTTP/2** (memoria 5.3, O4). `make pki` emite una CA
+- **mTLS interno con identidades SPIFFE y HTTP/2**. `make pki` emite una CA
   propia y un SVID X.509 por carga de trabajo (`spiffe://tfm.local/ns/poc/sa/<nombre>`); cada
   contenedor monta solo el suyo. Todo el tráfico de `backend-net` (gateway, servicios, BFF,
   colector, OPA y Keycloak) exige TLS 1.3 con certificado de cliente de esa CA: sin él no hay
